@@ -1,0 +1,2 @@
+"""CareCircle Lite backend package."""
+
