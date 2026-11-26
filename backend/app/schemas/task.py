@@ -1,81 +1,30 @@
 from datetime import date, datetime, timezone
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict
 
 from app.models.care_task import CareTask, TaskStatus, TaskType
-
-
-def _to_utc(value: datetime, field_name: str) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError(f"{field_name} must include timezone information.")
-    return value.astimezone(timezone.utc)
-
-
-def _clean_text(value: str, field_name: str) -> str:
-    cleaned = value.strip()
-    if not cleaned:
-        raise ValueError(f"{field_name} must not be blank.")
-    return cleaned
-
 
 class ErrorResponse(BaseModel):
     detail: str
 
 
 class TaskCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
     care_recipient_id: UUID
-    title: str = Field(..., min_length=1, max_length=255)
+    title: str
     description: str | None = None
     task_type: TaskType
     due_at: datetime
 
-    @field_validator("title")
-    @classmethod
-    def validate_title(cls, value: str) -> str:
-        return _clean_text(value, "title")
-
-    @field_validator("due_at")
-    @classmethod
-    def validate_due_at(cls, value: datetime) -> datetime:
-        return _to_utc(value, "due_at")
-
 
 class TaskUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str | None = Field(default=None, min_length=1, max_length=255)
+    title: str | None = None
     description: str | None = None
     task_type: TaskType | None = None
     due_at: datetime | None = None
 
-    @field_validator("title")
-    @classmethod
-    def validate_title(cls, value: str | None) -> str:
-        if value is None:
-            raise ValueError("title cannot be null.")
-        return _clean_text(value, "title")
-
-    @field_validator("task_type")
-    @classmethod
-    def validate_task_type(cls, value: TaskType | None) -> TaskType:
-        if value is None:
-            raise ValueError("task_type cannot be null.")
-        return value
-
-    @field_validator("due_at")
-    @classmethod
-    def validate_due_at(cls, value: datetime | None) -> datetime:
-        if value is None:
-            raise ValueError("due_at cannot be null.")
-        return _to_utc(value, "due_at")
-
 
 class TaskCompleteRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
     completed_by_id: UUID
 
 
@@ -91,19 +40,16 @@ class TaskResponse(BaseModel):
     status: TaskStatus
     is_overdue: bool
     completed_by_id: UUID | None
-    completed_by_name: str | None
-    completed_at: datetime | None
+    completed_by_name: str | None = None
+    completed_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
     @classmethod
-    def from_task(cls, task: CareTask, now_utc: datetime | None = None) -> "TaskResponse":
-        now = now_utc or datetime.now(timezone.utc)
-        due_utc = (
-            task.due_at.astimezone(timezone.utc)
-            if task.due_at.tzinfo is not None
-            else task.due_at.replace(tzinfo=timezone.utc)
-        )
+    def from_task(cls, task: CareTask) -> "TaskResponse":
+        now = datetime.now(timezone.utc)
+        due_utc = task.due_at if task.due_at.tzinfo else task.due_at.replace(tzinfo=timezone.utc)
+        
         return cls(
             id=task.id,
             care_recipient_id=task.care_recipient_id,
@@ -114,7 +60,7 @@ class TaskResponse(BaseModel):
             status=task.status,
             is_overdue=task.status == TaskStatus.PENDING and due_utc < now,
             completed_by_id=task.completed_by_id,
-            completed_by_name=task.completed_by.name if task.completed_by else None,
+            completed_by_name=task.completed_by.name if getattr(task, "completed_by", None) else None,
             completed_at=task.completed_at,
             created_at=task.created_at,
             updated_at=task.updated_at,

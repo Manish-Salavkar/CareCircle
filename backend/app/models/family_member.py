@@ -1,47 +1,31 @@
-import uuid
-from datetime import datetime
-from typing import TYPE_CHECKING
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
 
-from sqlalchemy import DateTime, ForeignKey, String, func, text
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship as orm_relationship
+from app.core.database import get_db
+from app.schemas.assistant import AssistantAskRequest
+from app.services import assistant_service, task_service
 
-from app.core.database import Base
+router = APIRouter(prefix="/api/assistant", tags=["assistant"])
 
-if TYPE_CHECKING:
-    from app.models.care_recipient import CareRecipient
-    from app.models.care_task import CareTask
+@router.post("/ask")
+async def ask_assistant_endpoint(
+    payload: AssistantAskRequest,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    recipient = task_service.resolve_care_recipient(db, payload.care_recipient_id)
 
-
-class FamilyMember(Base):
-    __tablename__ = "family_members"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-        server_default=text("gen_random_uuid()"),
-    )
-    care_recipient_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("care_recipients.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    relationship: Mapped[str] = mapped_column(String(100), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-    )
-
-    care_recipient: Mapped["CareRecipient"] = orm_relationship(
-        "CareRecipient",
-        back_populates="family_members",
-    )
-    completed_tasks: Mapped[list["CareTask"]] = orm_relationship(
-        "CareTask",
-        back_populates="completed_by",
-        passive_deletes=True,
+    return StreamingResponse(
+        assistant_service.stream_assistant_response(
+            request=request,
+            db=db,
+            question=payload.question,
+            care_recipient_id=recipient.id
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
     )

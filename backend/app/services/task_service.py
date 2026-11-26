@@ -3,10 +3,10 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
-from sqlalchemy import select, update
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
+from app.core.config import settings
 from app.models import CareRecipient, CareTask, FamilyMember, TaskStatus, TaskType
 from app.schemas.task import (
     FamilyMemberResponse,
@@ -17,67 +17,46 @@ from app.schemas.task import (
     TodayResponse,
 )
 
-
-def resolve_care_recipient(
-    db: Session,
-    care_recipient_id: UUID | None = None,
-) -> CareRecipient:
-    if care_recipient_id is not None:
+def resolve_care_recipient(db: Session, care_recipient_id: UUID | None = None) -> CareRecipient:
+    if care_recipient_id:
         recipient = db.get(CareRecipient, care_recipient_id)
-        if recipient is None:
+        if not recipient:
             raise HTTPException(status_code=404, detail="Care recipient not found.")
         return recipient
 
-    recipient = db.scalar(
-        select(CareRecipient).order_by(CareRecipient.created_at.asc()).limit(1)
-    )
-    if recipient is None:
+    recipient = db.scalar(select(CareRecipient).limit(1))
+    if not recipient:
         raise HTTPException(status_code=404, detail="No care recipient found.")
     return recipient
 
-
-def list_family_members(
-    db: Session,
-    care_recipient_id: UUID | None = None,
-) -> list[FamilyMemberResponse]:
+def list_family_members(db: Session, care_recipient_id: UUID | None = None) -> list[FamilyMemberResponse]:
     recipient = resolve_care_recipient(db, care_recipient_id)
     members = db.scalars(
         select(FamilyMember)
         .where(FamilyMember.care_recipient_id == recipient.id)
-        .order_by(FamilyMember.name.asc(), FamilyMember.created_at.asc())
     ).all()
     return [FamilyMemberResponse.model_validate(m) for m in members]
-
 
 def list_tasks(
     db: Session,
     status: TaskStatus | None = None,
     task_type: TaskType | None = None,
     care_recipient_id: UUID | None = None,
-    now_utc: datetime | None = None,
 ) -> list[TaskResponse]:
-    stmt = (
-        select(CareTask)
-        .options(joinedload(CareTask.completed_by))
-        .order_by(CareTask.due_at.asc(), CareTask.created_at.asc())
-    )
-    if care_recipient_id is not None:
+    stmt = select(CareTask)
+    
+    if care_recipient_id:
         stmt = stmt.where(CareTask.care_recipient_id == care_recipient_id)
-    if status is not None:
+    if status:
         stmt = stmt.where(CareTask.status == status)
-    if task_type is not None:
+    if task_type:
         stmt = stmt.where(CareTask.task_type == task_type)
 
     tasks = db.scalars(stmt).all()
-    return [TaskResponse.from_task(t, now_utc=now_utc) for t in tasks]
+    return [TaskResponse.from_task(t) for t in tasks]
 
-
-def create_task(
-    db: Session,
-    payload: TaskCreate,
-    now_utc: datetime | None = None,
-) -> TaskResponse:
-    if db.get(CareRecipient, payload.care_recipient_id) is None:
+def create_task(db: Session, payload: TaskCreate) -> TaskResponse:
+    if not db.get(CareRecipient, payload.care_recipient_id):
         raise HTTPException(status_code=404, detail="Care recipient not found.")
 
     task = CareTask(
@@ -85,46 +64,27 @@ def create_task(
         title=payload.title,
         description=payload.description,
         task_type=payload.task_type,
-        due_at=payload.due_at.astimezone(timezone.utc),
+        due_at=payload.due_at,
         status=TaskStatus.PENDING,
     )
     db.add(task)
     db.commit()
     db.refresh(task)
-    return TaskResponse.from_task(task, now_utc=now_utc)
+    return TaskResponse.from_task(task)
 
-
-def _find_task(db: Session, task_id: UUID) -> CareTask:
-    task = db.scalar(
-        select(CareTask)
-        .options(joinedload(CareTask.completed_by))
-        .where(CareTask.id == task_id)
-    )
-    if task is None:
+def get_task(db: Session, task_id: UUID) -> TaskResponse:
+    task = db.get(CareTask, task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Care task not found.")
-    return task
+    return TaskResponse.from_task(task)
 
-
-def get_task(
-    db: Session,
-    task_id: UUID,
-    now_utc: datetime | None = None,
-) -> TaskResponse:
-    return TaskResponse.from_task(_find_task(db, task_id), now_utc=now_utc)
-
-
-def update_task(
-    db: Session,
-    task_id: UUID,
-    payload: TaskUpdate,
-    now_utc: datetime | None = None,
-) -> TaskResponse:
-    task = _find_task(db, task_id)
+def update_task(db: Session, task_id: UUID, payload: TaskUpdate) -> TaskResponse:
+    task = db.get(CareTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Care task not found.")
+    
     updates = payload.model_dump(exclude_unset=True)
-
     for field, value in updates.items():
-        if field == "due_at" and value is not None:
-            value = value.astimezone(timezone.utc)
         setattr(task, field, value)
 
     if updates:
@@ -132,53 +92,31 @@ def update_task(
         db.commit()
         db.refresh(task)
 
-    return TaskResponse.from_task(task, now_utc=now_utc)
+    return TaskResponse.from_task(task)
 
-
-def complete_task(
-    db: Session,
-    task_id: UUID,
-    completed_by_id: UUID,
-    now_utc: datetime | None = None,
-) -> TaskResponse:
+def complete_task(db: Session, task_id: UUID, completed_by_id: UUID) -> TaskResponse:
     task = db.get(CareTask, task_id)
-    if task is None:
+    if not task:
         raise HTTPException(status_code=404, detail="Care task not found.")
 
     member = db.get(FamilyMember, completed_by_id)
-    if member is None:
+    if not member:
         raise HTTPException(status_code=404, detail="Family member not found.")
 
     if member.care_recipient_id != task.care_recipient_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Family member does not belong to the care recipient for this task.",
-        )
+        raise HTTPException(status_code=400, detail="Invalid family member.")
 
     if task.status == TaskStatus.DONE:
-        raise HTTPException(status_code=409, detail="Care task is already completed.")
+        raise HTTPException(status_code=400, detail="Task already completed.")
 
-    # Conditional update prevents two concurrent requests from overwriting completion audit data
-    completion_time = now_utc or datetime.now(timezone.utc)
-    stmt = (
-        update(CareTask)
-        .where(CareTask.id == task_id, CareTask.status == TaskStatus.PENDING)
-        .values(
-            status=TaskStatus.DONE,
-            completed_by_id=member.id,
-            completed_at=completion_time,
-            updated_at=completion_time,
-        )
-        .returning(CareTask.id)
-    )
-    if db.execute(stmt).scalar_one_or_none() is None:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="Care task is already completed.")
-
+    task.status = TaskStatus.DONE
+    task.completed_by_id = member.id
+    task.completed_at = datetime.now(timezone.utc)
+    task.updated_at = datetime.now(timezone.utc)
+    
     db.commit()
-    db.expire_all()
-    return TaskResponse.from_task(_find_task(db, task_id), now_utc=completion_time)
-
+    db.refresh(task)
+    return TaskResponse.from_task(task)
 
 def get_today_tasks(
     db: Session,
@@ -187,64 +125,48 @@ def get_today_tasks(
     tz_name: str | None = None,
 ) -> TodayResponse:
     recipient = resolve_care_recipient(db, care_recipient_id)
+    
+    tz = tz_name or settings.app_timezone
+    local_tz = ZoneInfo(tz)
+    current_utc = now_utc or datetime.now(timezone.utc)
+    today_date = current_utc.astimezone(local_tz).date()
 
-    local_tz = ZoneInfo(tz_name or get_settings().app_timezone)
-    reference_utc = now_utc or datetime.now(timezone.utc)
-    today_date = reference_utc.astimezone(local_tz).date()
-
-    # Convert local start/end of day to UTC for database filtering
     today_start_utc = datetime.combine(today_date, time.min, tzinfo=local_tz).astimezone(timezone.utc)
     tomorrow_start_utc = datetime.combine(today_date + timedelta(days=1), time.min, tzinfo=local_tz).astimezone(timezone.utc)
 
-    overdue_tasks = db.scalars(
+    all_tasks = db.scalars(
         select(CareTask)
-        .options(joinedload(CareTask.completed_by))
-        .where(
-            CareTask.care_recipient_id == recipient.id,
-            CareTask.status == TaskStatus.PENDING,
-            CareTask.due_at < reference_utc,
-        )
-        .order_by(CareTask.due_at.asc(), CareTask.created_at.asc())
+        .where(CareTask.care_recipient_id == recipient.id)
     ).all()
+    
+    overdue_tasks = []
+    due_tasks = []
+    done_tasks = []
+    
+    for task in all_tasks:
+        if task.status == TaskStatus.PENDING:
+            if task.due_at < current_utc:
+                overdue_tasks.append(task)
+            elif task.due_at >= current_utc and task.due_at < tomorrow_start_utc:
+                due_tasks.append(task)
+        elif task.status == TaskStatus.DONE and task.completed_at:
+            if task.completed_at >= today_start_utc and task.completed_at < tomorrow_start_utc:
+                done_tasks.append(task)
 
-    due_tasks = db.scalars(
-        select(CareTask)
-        .options(joinedload(CareTask.completed_by))
-        .where(
-            CareTask.care_recipient_id == recipient.id,
-            CareTask.status == TaskStatus.PENDING,
-            CareTask.due_at >= reference_utc,
-            CareTask.due_at < tomorrow_start_utc,
-        )
-        .order_by(CareTask.due_at.asc(), CareTask.created_at.asc())
-    ).all()
-
-    done_tasks = db.scalars(
-        select(CareTask)
-        .options(joinedload(CareTask.completed_by))
-        .where(
-            CareTask.care_recipient_id == recipient.id,
-            CareTask.status == TaskStatus.DONE,
-            CareTask.completed_at >= today_start_utc,
-            CareTask.completed_at < tomorrow_start_utc,
-        )
-        .order_by(CareTask.completed_at.desc(), CareTask.created_at.asc())
-    ).all()
-
-    overdue_items = [TaskResponse.from_task(t, now_utc=reference_utc) for t in overdue_tasks]
-    due_items = [TaskResponse.from_task(t, now_utc=reference_utc) for t in due_tasks]
-    done_items = [TaskResponse.from_task(t, now_utc=reference_utc) for t in done_tasks]
+    overdue_tasks.sort(key=lambda t: t.due_at)
+    due_tasks.sort(key=lambda t: t.due_at)
+    done_tasks.sort(key=lambda t: t.completed_at, reverse=True)
 
     return TodayResponse(
         date=today_date,
         care_recipient_id=recipient.id,
         care_recipient_name=recipient.name,
-        overdue=overdue_items,
-        due=due_items,
-        done=done_items,
+        overdue=[TaskResponse.from_task(t) for t in overdue_tasks],
+        due=[TaskResponse.from_task(t) for t in due_tasks],
+        done=[TaskResponse.from_task(t) for t in done_tasks],
         counts=TodayCounts(
-            overdue=len(overdue_items),
-            due=len(due_items),
-            done=len(done_items),
+            overdue=len(overdue_tasks),
+            due=len(due_tasks),
+            done=len(done_tasks),
         ),
     )
